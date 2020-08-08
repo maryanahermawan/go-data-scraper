@@ -60,43 +60,6 @@ type RedditBasicInfo struct {
 	SubredditSubscription RedditResponse
 }
 
-func getRedditListingHandler(w http.ResponseWriter, r *http.Request) {
-	client := &http.Client{}
-
-	popularityType := r.URL.Path[len("/reddit/"):]
-
-	period, ok := r.URL.Query()["period"]
-	if !ok {
-		log.Println("Url Param 'period' is missing")
-		period = append(period, "week") //Default value
-	}
-
-	listingCount, ok := r.URL.Query()["count"]
-	if !ok {
-		listingCount = append(listingCount, strconv.Itoa(3))
-	}
-	log.Println("Popularity Period count", popularityType, period, listingCount)
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/r/golang/%s/.json?t=%s&limit=%s", popularityType, period[0], listingCount[0]), nil)
-	req.Header.Add("User-Agent", "web:learn-golang:v0.0 (by /u/maryanahermawan)")
-	resp, err := client.Do(req)
-	if err != nil {
-		// handle error
-	}
-
-	resp.Body = http.MaxBytesReader(w, resp.Body, 1048576)
-	dec := json.NewDecoder(resp.Body)
-	var redditResponse RedditResponse
-	if err := dec.Decode(&redditResponse); err != nil {
-		log.Println(err)
-		return
-	}
-	log.Println("Response header is", resp.Header)
-	enc := json.NewEncoder(w)
-	if err := enc.Encode(&redditResponse); err != nil {
-		log.Println(err)
-	}
-}
-
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Go web scraper backend.")
 }
@@ -170,7 +133,6 @@ func redditCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, respError := ioutil.ReadAll(resp.Body)
-	log.Println("Raw body is", string(body))
 
 	var m RedditBearerTokenResponse
 	unmarshalError := json.Unmarshal(body, &m)
@@ -189,28 +151,90 @@ func redditCallback(w http.ResponseWriter, r *http.Request) {
 func getRedditBasicInfo(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{}
 
-	//get username
+	//if request header does not contain "access-token", return unauthorized
+	if r.Header.Get("access-token") == "" {
+		log.Println("No access token")
+		http.Error(w, "No access token", http.StatusUnauthorized)
+	}
+
+	fmt.Println("Authorization is", r.Header.Get("access-token"))
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/api/v1/me"), nil)
 	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
-	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", redditBearerToken.AccessToken))
-	resp, _ := client.Do(req)
+	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.Header.Get("access-token")))
+	resp, err := client.Do(req)
+
+	if err != nil {
+		//if Reddit reject, return error message in body and original status
+		fmt.Println("Error is ", err.Error())
+		http.Error(w, err.Error(), resp.StatusCode)
+	}
 	body, _ := ioutil.ReadAll(resp.Body)
 
 	var redditBasicInfo RedditBasicInfo
 	json.Unmarshal(body, &redditBasicInfo)
 
-	//get subreddits
+	//get user's subreddits
 	req, _ = http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/subreddits/mine/subscriber"), nil)
 	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
-	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", redditBearerToken.AccessToken))
-	resp, _ = client.Do(req)
+	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.Header.Get("access-token")))
+	resp, err = client.Do(req)
+	if err != nil {
+		//if Reddit reject, return error message in body and original status
+		fmt.Println("Error 2 is ", err.Error())
+		http.Error(w, err.Error(), resp.StatusCode)
+	}
 	body, _ = ioutil.ReadAll(resp.Body)
-	// log.Println("Raw body is", string(body))
 
 	var subreddits RedditResponse
 	json.Unmarshal(body, &subreddits)
 	redditBasicInfo.SubredditSubscription = subreddits
 	json.NewEncoder(w).Encode(&redditBasicInfo)
+}
+
+func getRedditListingHandler(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{}
+
+	popularityType := r.URL.Path[len("/reddit/"):]
+
+	subreddit, ok := r.URL.Query()["subreddit"]
+	if !ok {
+		log.Println("Url Param 'subreddit' is missing")
+		http.Error(w, "Compulsory URL Param subreddit is missing", http.StatusBadRequest)
+	}
+
+	period, periodOk := r.URL.Query()["period"]
+	if !periodOk {
+		log.Println("Url Param 'period' is missing")
+		period = append(period, "week") //Default value
+	}
+
+	listingCount, ok := r.URL.Query()["count"]
+	if !ok {
+		listingCount = append(listingCount, strconv.Itoa(3))
+	}
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/r/%s/%s/.json?t=%s&limit=%s", subreddit[0], popularityType, period[0], listingCount[0]), nil)
+	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
+	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.Header.Get("access-token")))
+	resp, err := client.Do(req)
+	if err != nil {
+		// handle error
+		log.Println("error in getting reddit listing: ", err)
+	}
+
+	resp.Body = http.MaxBytesReader(w, resp.Body, 1048576)
+	dec := json.NewDecoder(resp.Body)
+	var redditResponse RedditResponse
+	if err := dec.Decode(&redditResponse); err != nil {
+		log.Printf("error decoding body: %q", resp.Body)
+		log.Printf("error: %v", err)
+		return
+	}
+
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(&redditResponse); err != nil {
+		log.Println(err)
+	}
 }
 
 // func getLatestFbPostsHandler(w http.ResponseWriter, r *http.Request){
@@ -240,11 +264,11 @@ func facebookAuthenticate(w http.ResponseWriter, r *http.Request) {
 		TokenURL: "https://graph.facebook.com/v2.7/oauth/access_token",
 	}
 	conf := &oauth2.Config{
-		ClientID: fbClientID,
+		ClientID:     fbClientID,
 		ClientSecret: fbClientSecret,
-		Scopes: []string{"public_profile", "email", "user_posts"},
-		Endpoint: Facebook,
-		RedirectURL: redirectURL,
+		Scopes:       []string{"public_profile", "email", "user_posts"},
+		Endpoint:     Facebook,
+		RedirectURL:  redirectURL,
 	}
 
 	req, err := http.NewRequest("GET", conf.Endpoint.AuthURL, nil)
@@ -262,32 +286,36 @@ func facebookAuthenticate(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(req.URL.String()))
 }
 
-
 func corsHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// if r.Method == "OPTIONS" {
-		//handle preflight in here
-		log.Print("preflight detected: ", r.Header)
-		w.Header().Add("Access-Control-Allow-Credentials", "true")
-		w.Header().Add("Access-Control-Max-Age", "3600")
-		w.Header().Add("Access-Control-Allow-Origin", "*")
-		w.Header().Add("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		w.Header().Add("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-Requested-With, remember-me, X-CSRF-Token, Authorization, code, state")
-		// }
-		fn(w, r)
-		return
+		switch r.Method {
+		case "OPTIONS":
+			//handle preflight in here; OPTIONS will return status 200
+			// log.Print("preflight detected: ", r.Header)
+			w.Header().Add("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Access-Control-Max-Age", "3600")
+			w.Header().Add("Access-Control-Allow-Origin", "*")
+			w.Header().Add("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			w.Header().Add("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-Requested-With, remember-me, X-CSRF-Token, access-token, code, state")
+			return
+		default:
+			//other methods still need "Access-Control-Allow-Origin"
+			w.Header().Add("Access-Control-Allow-Origin", "*")
+			fn(w, r)
+			return
+		}
 	}
 }
 
 func main() {
 	godotenv.Load()
-	http.HandleFunc("/", homeHandler)
+	http.HandleFunc("/", corsHandler(homeHandler))
 	http.HandleFunc("/reddit/", corsHandler(getRedditListingHandler))
-	
 	http.HandleFunc("/reddit/authenticate", corsHandler(redditAuthenticate))
 	http.HandleFunc("/reddit_callback", corsHandler(redditCallback))
-	http.HandleFunc("/fb/authenticate", corsHandler(facebookAuthenticate))
+	http.HandleFunc("/reddit_basic_info", corsHandler(getRedditBasicInfo))
+
+	// http.HandleFunc("/fb/authenticate", corsHandler(facebookAuthenticate))
 	// http.HandleFunc("/fb_callback", corsHandler(fbCallback))
-	// http.HandleFunc("/", corsHandler(homeHandler))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
