@@ -1,9 +1,11 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 	"golang.org/x/oauth2"
 	"io/ioutil"
 	"log"
@@ -37,15 +39,16 @@ type RedditEntity struct {
 //RedditData : fields are picked
 type RedditData struct {
 	Subreddit      string
-	AuthorFullname string `json:"author_fullname"`
+	Author 		   string
 	Title          string
-	SelftextHTML   string `json:"selftext_html"`
+	Selftext   	   string
 	Name           string //the full name of this reddit object t1_*, t2_*, ...
 	Ups            uint16
 	Downs          uint16
 	Permalink      string //the comments
 	URL            string
 	PublicDescHTML string `json:"public_description_html"`
+	Body		   string 
 }
 
 //RedditBearerTokenResponse : Reddit response with bearer token
@@ -60,13 +63,14 @@ type RedditBasicInfo struct {
 	SubredditSubscription RedditResponse
 }
 
-func homeHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Go web scraper backend.")
+func homeHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	fmt.Fprintf(w, "Hello.")
 }
 
-func redditAuthenticate(w http.ResponseWriter, r *http.Request) {
+func redditAuthenticate(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	redditState, exists := os.LookupEnv("REDDIT_STATE")
 	redditClientID, _ := os.LookupEnv("REDDIT_CLIENT_ID")
+	redirectURL, _ := os.LookupEnv("REDDIT_URL_REDIRECT")
 	if !exists {
 		log.Println("File .env not found")
 	}
@@ -80,14 +84,14 @@ func redditAuthenticate(w http.ResponseWriter, r *http.Request) {
 	q.Add("client_id", redditClientID)
 	q.Add("response_type", "code")
 	q.Add("state", redditState)
-	q.Add("redirect_uri", "http://127.0.0.1:8080/reddit_callback")
+	q.Add("redirect_uri", redirectURL)
 	q.Add("duration", "temporary")
-	q.Add("scope", "identity,mysubreddits,read")
+	q.Add("scope", "identity history mysubreddits read wikiread")
 	req.URL.RawQuery = q.Encode()
 	w.Write([]byte(req.URL.String()))
 }
 
-func redditCallback(w http.ResponseWriter, r *http.Request) {
+func redditCallback(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	redditSecret, exists := os.LookupEnv("REDDIT_AUTHORIZATION")
 	redditState, _ := os.LookupEnv("REDDIT_STATE")
 	frontEndURL, _ := os.LookupEnv("FRONTEND_URL_REDIRECT_TO_RETURN_ACCESS_TOKEN")
@@ -148,7 +152,7 @@ func redditCallback(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusTemporaryRedirect)
 }
 
-func getRedditBasicInfo(w http.ResponseWriter, r *http.Request) {
+func getRedditBasicInfo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	client := &http.Client{}
 
 	//if request header does not contain "access-token", return unauthorized
@@ -157,7 +161,6 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No access token", http.StatusUnauthorized)
 	}
 
-	fmt.Println("Authorization is", r.Header.Get("access-token"))
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/api/v1/me"), nil)
 	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
 	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.Header.Get("access-token")))
@@ -189,12 +192,76 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal(body, &subreddits)
 	redditBasicInfo.SubredditSubscription = subreddits
 	json.NewEncoder(w).Encode(&redditBasicInfo)
+ 
+	//Insert user and subreddit names into DB in doesn't exist:
+	queryStmt := `SELECT id, username FROM users WHERE username =$1` 
+	insertStmt := `INSERT INTO users (username) VALUES ($1) returning id`
+	var id int
+	var username string
+	switch err = db.QueryRow(queryStmt, redditBasicInfo.Name).Scan(&id, &username); err {
+		case sql.ErrNoRows:
+			fmt.Println("New username>", redditBasicInfo.Name)
+			var id int
+			err := db.QueryRow(insertStmt, redditBasicInfo.Name).Scan(&id)
+			if err != nil {
+				panic(err)
+			}
+		case nil:
+			fmt.Println("Username previously saved in DB; ID>", id)
+		default:
+			panic(err)
+	}
+	
+	//update subreddits table:
+	queryStmt = `SELECT name FROM subreddits WHERE name =$1` 
+	insertStmt = `INSERT INTO subreddits (name) VALUES ($1) returning id`;
+	for _, sr := range subreddits.Data.Children {
+		row := db.QueryRow(queryStmt, sr.Data.URL)
+		fmt.Println("DEBUG", sr.Data.URL)
+		var name string
+		switch err := row.Scan(&name); err {
+			case sql.ErrNoRows:
+				fmt.Println("New subreddit not in DB yet> ",  sr.Data.URL)
+				var id int
+				err := db.QueryRow(insertStmt, sr.Data.URL).Scan(&id)
+				if err != nil {
+					panic(err)
+				}
+			case nil:
+				fmt.Println("Subreddit previously saved in DB> ", id)
+			default:
+				panic(err)
+		}
+	}
+
+	//update subreddit_subscriptions table
+	queryStmt = `SELECT id FROM users_subscription WHERE username =$1 and subreddit_name=$2` 
+	insertStmt = `INSERT INTO users_subscription (username, subreddit_name) VALUES ($1, $2) returning id`;
+	for _, sr := range subreddits.Data.Children {
+		row := db.QueryRow(queryStmt, username, sr.Data.URL)
+		var id int
+		switch err := row.Scan(&id); err {
+			case sql.ErrNoRows:
+				fmt.Printf("DEBUG username is %s", username)
+				fmt.Printf("New subscription for user:%s subreddit %s> ", username, sr.Data.URL)
+				var id int
+				err := db.QueryRow(insertStmt, username, sr.Data.URL).Scan(&id)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println("The new subscription inserted; ID is ", id)
+			case nil:
+				fmt.Println("Subscription previously saved in DB> ", id)
+			default:
+				panic(err)
+		}
+	}
 }
 
-func getRedditListingHandler(w http.ResponseWriter, r *http.Request) {
+func getRedditListingHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	client := &http.Client{}
 
-	popularityType := r.URL.Path[len("/reddit/"):]
+	popularityType := r.URL.Path[len("/api/reddit/"):]
 
 	subreddit, ok := r.URL.Query()["subreddit"]
 	if !ok {
@@ -231,9 +298,84 @@ func getRedditListingHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//update top_listings table:
+	queryStmt := `SELECT id FROM top_listings WHERE reddit_id =$1` 
+	insertStmt := `INSERT INTO top_listings (subreddit_name, reddit_id, listing_title, permalink, selftext, url, author) VALUES ($1, $2, $3, $4, $5, $6, $7) returning id`;
+	for _, listing :=  range redditResponse.Data.Children {
+		listingData := listing.Data
+		row := db.QueryRow(queryStmt, listingData.Name)
+		var id int
+		switch err := row.Scan(&id); err {
+			case sql.ErrNoRows:
+				err := db.QueryRow(insertStmt, fmt.Sprintf("/r/%s/", listingData.Subreddit), listingData.Name, listingData.Title, listingData.Permalink, listingData.Selftext, listingData.URL, listingData.Author).Scan(&id)
+				if err != nil {
+					panic(err)
+				}
+				// fmt.Println("Listing inserted; ID is ", id)
+			case nil:
+				// fmt.Println("Listing previously saved in DB> ", id)
+			default:
+				panic(err)
+		}
+		getRedditComment(listing.Data.Permalink,  id, r.Header.Get("access-token"), db)
+
+	}
+
 	enc := json.NewEncoder(w)
 	if err := enc.Encode(&redditResponse); err != nil {
 		log.Println(err)
+	}
+}
+
+
+
+func getRedditComment(permalink string, listingID int, accessToken string, db *sql.DB)  {
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com%s.json?sort=top&limit=3&depth=100", permalink), nil)
+	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
+	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", accessToken))
+	// fmt.Println("Request is ", req.Header, req.URL)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+        log.Fatal(err)
+	}
+	var postAndCommentResp []RedditResponse
+	json.Unmarshal(body, &postAndCommentResp)
+
+	var commentResp []RedditEntity
+	for _, item := range postAndCommentResp {
+		if item.Data.Children[0].Kind == "t1" {
+			commentResp = item.Data.Children
+		} else {
+			commentResp = []RedditEntity {
+				RedditEntity{},
+			}
+		}
+	}
+
+	queryStmt := `SELECT id FROM listing_comments WHERE comment_id =$1` 
+	insertStmt := `INSERT INTO listing_comments (listing_id, comment_body, comment_id, author) VALUES ($1, $2, $3, $4) returning id`;
+	for _, commentItem := range commentResp {
+		row := db.QueryRow(queryStmt, listingID)
+		var id int
+		switch err := row.Scan(&id); err {
+			case sql.ErrNoRows:
+				var id int
+				err := db.QueryRow(insertStmt, listingID, commentItem.Data.Body, commentItem.Data.Name, commentItem.Data.Author).Scan(&id)
+				if err != nil {
+					panic(err)
+				}
+				// fmt.Println("New comment inserted; ID is ", id)
+			case nil:
+				// fmt.Println("Comment previously saved in DB> ", id)
+			default:
+				panic(err)
+		}
 	}
 }
 
@@ -250,7 +392,7 @@ func getRedditListingHandler(w http.ResponseWriter, r *http.Request) {
 // 	);
 // }
 
-func facebookAuthenticate(w http.ResponseWriter, r *http.Request) {
+func facebookAuthenticate(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	fbClientID, exists := os.LookupEnv("FB_CLIENT_ID")
 	fbClientSecret, _ := os.LookupEnv("FB_CLIENT_SECRET")
 	fbState, _ := os.LookupEnv("FB_STATE")
@@ -286,12 +428,11 @@ func facebookAuthenticate(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(req.URL.String()))
 }
 
-func corsHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+func corsHandler(fn func(http.ResponseWriter, *http.Request, *sql.DB), db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "OPTIONS":
 			//handle preflight in here; OPTIONS will return status 200
-			// log.Print("preflight detected: ", r.Header)
 			w.Header().Add("Access-Control-Allow-Credentials", "true")
 			w.Header().Add("Access-Control-Max-Age", "3600")
 			w.Header().Add("Access-Control-Allow-Origin", "*")
@@ -301,7 +442,7 @@ func corsHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		default:
 			//other methods still need "Access-Control-Allow-Origin"
 			w.Header().Add("Access-Control-Allow-Origin", "*")
-			fn(w, r)
+			fn(w, r, db)
 			return
 		}
 	}
@@ -309,13 +450,42 @@ func corsHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 
 func main() {
 	godotenv.Load()
-	http.HandleFunc("/", corsHandler(homeHandler))
-	http.HandleFunc("/reddit/", corsHandler(getRedditListingHandler))
-	http.HandleFunc("/reddit/authenticate", corsHandler(redditAuthenticate))
-	http.HandleFunc("/reddit_callback", corsHandler(redditCallback))
-	http.HandleFunc("/reddit_basic_info", corsHandler(getRedditBasicInfo))
+	host, exists := os.LookupEnv("DB_HOST")
+	port, _ := os.LookupEnv("DB_PORT")
+	user, _ := os.LookupEnv("DB_USER")
+	password, _ := os.LookupEnv("DB_PASSWORD")
+	dbname, _ := os.LookupEnv("DB_NAME")
+	if !exists {
+		log.Println("File .env not found")
+	}
+	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s "+
+		"password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname)
 
+	//sql.Open does not open new connection
+	db, err := sql.Open("postgres", psqlInfo)
+	if err != nil {
+		panic(err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+
+	http.HandleFunc("/api/", corsHandler(homeHandler, db))
+	http.HandleFunc("/api/reddit/", corsHandler(getRedditListingHandler, db))
+	http.HandleFunc("/api/reddit/authenticate", corsHandler(redditAuthenticate, db))
+	http.HandleFunc("/api/reddit_callback", corsHandler(redditCallback, db))
+	http.HandleFunc("/api/reddit_basic_info", corsHandler(getRedditBasicInfo, db))
+
+	// http.HandleFunc("/", homeHandler)
+	// http.HandleFunc("/reddit/", getRedditListingHandler)
+	// http.HandleFunc("/reddit/authenticate", redditAuthenticate)
+	// http.HandleFunc("/reddit_callback", redditCallback)
+	// http.HandleFunc("/reddit_basic_info", getRedditBasicInfo)
 	// http.HandleFunc("/fb/authenticate", corsHandler(facebookAuthenticate))
 	// http.HandleFunc("/fb_callback", corsHandler(fbCallback))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":80", nil))
 }
