@@ -63,6 +63,11 @@ type RedditBasicInfo struct {
 	SubredditSubscription RedditResponse
 }
 
+type ListingAndCommentChannel struct {
+	Permalink	string
+	ID			int
+}
+
 func homeHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	fmt.Fprintf(w, "Hello.")
 }
@@ -258,9 +263,7 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 }
 
-func getRedditListingHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	client := &http.Client{}
-
+func getRedditHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	popularityType := r.URL.Path[len("/api/reddit/"):]
 
 	subreddit, ok := r.URL.Query()["subreddit"]
@@ -268,6 +271,7 @@ func getRedditListingHandler(w http.ResponseWriter, r *http.Request, db *sql.DB)
 		log.Println("Url Param 'subreddit' is missing")
 		http.Error(w, "Compulsory URL Param subreddit is missing", http.StatusBadRequest)
 	}
+	srArray := strings.Split(subreddit[0], ",")
 
 	period, periodOk := r.URL.Query()["period"]
 	if !periodOk {
@@ -279,17 +283,43 @@ func getRedditListingHandler(w http.ResponseWriter, r *http.Request, db *sql.DB)
 	if !ok {
 		listingCount = append(listingCount, strconv.Itoa(3))
 	}
+	accessToken := r.Header.Get("access-token")
 
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/r/%s/%s/.json?t=%s&limit=%s", subreddit[0], popularityType, period[0], listingCount[0]), nil)
+	fmt.Println("DEBUG SUBREDDIT ARRAY has", len(srArray))
+	listingAndCommentChan := make (chan ListingAndCommentChannel, 3*len(srArray)) //there are N*3 listings(N=number of subreddits)
+	listingToHandler := make (chan RedditResponse, len(srArray))
+	for _, sr := range srArray {
+		go getRedditListingWorker(accessToken, db, sr, popularityType, period[0], listingCount[0], listingAndCommentChan, listingToHandler)
+		go getRedditCommentWorker(accessToken, db, listingAndCommentChan)
+	}
+
+	var listingArray []RedditResponse
+
+	for i:=0; i<len(srArray); i++ {
+		listingArray = append(listingArray, <-listingToHandler)
+	}
+
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(&listingArray); err != nil {
+		log.Println(err)
+	}
+}
+
+func getRedditListingWorker(accessToken string, db *sql.DB, sr string, popularityType string, t string, count string, 
+	listingToCommentWorker chan ListingAndCommentChannel, listingToHandler chan RedditResponse) {
+	fmt.Println("The beginning of LISTING worker")
+	client := &http.Client{}
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com/r/%s/%s/.json?t=%s&limit=%s", sr, popularityType, t, count), nil)
 	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
-	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", r.Header.Get("access-token")))
+	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", accessToken))
 	resp, err := client.Do(req)
 	if err != nil {
 		// handle error
 		log.Println("error in getting reddit listing: ", err)
 	}
 
-	resp.Body = http.MaxBytesReader(w, resp.Body, 1048576)
+	// resp.Body = http.MaxBytesReader(w, resp.Body, 1048576)
 	dec := json.NewDecoder(resp.Body)
 	var redditResponse RedditResponse
 	if err := dec.Decode(&redditResponse); err != nil {
@@ -298,83 +328,91 @@ func getRedditListingHandler(w http.ResponseWriter, r *http.Request, db *sql.DB)
 		return
 	}
 
-	//update top_listings table:
+	//update handler of the listing response
+	listingToHandler <- redditResponse
+	//update top_listings table and update channel to comment-worker:
 	queryStmt := `SELECT id FROM top_listings WHERE reddit_id =$1` 
 	insertStmt := `INSERT INTO top_listings (subreddit_name, reddit_id, listing_title, permalink, selftext, url, author) VALUES ($1, $2, $3, $4, $5, $6, $7) returning id`;
 	for _, listing :=  range redditResponse.Data.Children {
 		listingData := listing.Data
+		
 		row := db.QueryRow(queryStmt, listingData.Name)
 		var id int
 		switch err := row.Scan(&id); err {
 			case sql.ErrNoRows:
+				fmt.Println("Inserting listing for subredditname : ", listingData.Subreddit)
 				err := db.QueryRow(insertStmt, fmt.Sprintf("/r/%s/", listingData.Subreddit), listingData.Name, listingData.Title, listingData.Permalink, listingData.Selftext, listingData.URL, listingData.Author).Scan(&id)
 				if err != nil {
 					panic(err)
 				}
-				// fmt.Println("Listing inserted; ID is ", id)
+				fmt.Println("Listing inserted; ID is ", id)
 			case nil:
-				// fmt.Println("Listing previously saved in DB> ", id)
+				fmt.Println("Listing previously saved in DB> ", id)
 			default:
 				panic(err)
 		}
-		getRedditComment(listing.Data.Permalink,  id, r.Header.Get("access-token"), db)
 
+		//Send listing.Data.Permalink, id (obtain from DB actions above) to channel
+		fmt.Println("Sending to Comment worker, for listingtitle", listing.Data.Title)
+		listingToCommentWorker <- ListingAndCommentChannel{Permalink: listing.Data.Permalink, ID: id}
 	}
-
-	enc := json.NewEncoder(w)
-	if err := enc.Encode(&redditResponse); err != nil {
-		log.Println(err)
-	}
+	fmt.Println("The END of LISTING worker")
 }
 
 
+func getRedditCommentWorker(accessToken string, db *sql.DB, inChan chan ListingAndCommentChannel)  {
+	fmt.Println("The beginning of COMMENT worker")
+	for {
+		select {
+		case listingInfo := <- inChan:
+			fmt.Println("Comment worker just received from listing worker")
+			req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com%s.json?sort=top&limit=3", listingInfo.Permalink), nil)
+			req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
+			req.Header.Add("Authorization", fmt.Sprintf("bearer %s", accessToken))
 
-func getRedditComment(permalink string, listingID int, accessToken string, db *sql.DB)  {
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://oauth.reddit.com%s.json?sort=top&limit=3&depth=100", permalink), nil)
-	req.Header.Add("User-Agent", "web:uncluttered:v0.0 (by /u/maryanahermawan)")
-	req.Header.Add("Authorization", fmt.Sprintf("bearer %s", accessToken))
-	// fmt.Println("Request is ", req.Header, req.URL)
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		panic(err)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-        log.Fatal(err)
-	}
-	var postAndCommentResp []RedditResponse
-	json.Unmarshal(body, &postAndCommentResp)
-
-	var commentResp []RedditEntity
-	for _, item := range postAndCommentResp {
-		if item.Data.Children[0].Kind == "t1" {
-			commentResp = item.Data.Children
-		} else {
-			commentResp = []RedditEntity {
-				RedditEntity{},
-			}
-		}
-	}
-
-	queryStmt := `SELECT id FROM listing_comments WHERE comment_id =$1` 
-	insertStmt := `INSERT INTO listing_comments (listing_id, comment_body, comment_id, author) VALUES ($1, $2, $3, $4) returning id`;
-	for _, commentItem := range commentResp {
-		row := db.QueryRow(queryStmt, listingID)
-		var id int
-		switch err := row.Scan(&id); err {
-			case sql.ErrNoRows:
-				var id int
-				err := db.QueryRow(insertStmt, listingID, commentItem.Data.Body, commentItem.Data.Name, commentItem.Data.Author).Scan(&id)
-				if err != nil {
-					panic(err)
-				}
-				// fmt.Println("New comment inserted; ID is ", id)
-			case nil:
-				// fmt.Println("Comment previously saved in DB> ", id)
-			default:
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
 				panic(err)
+			}
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				log.Fatal(err)
+			}
+			var postAndCommentResp []RedditResponse
+			json.Unmarshal(body, &postAndCommentResp)
+
+			var commentResp []RedditEntity
+			for _, item := range postAndCommentResp {
+				if item.Data.Children[0].Kind == "t1" {
+					commentResp = item.Data.Children
+				} else {
+					commentResp = []RedditEntity {
+						RedditEntity{},
+					}
+				}
+			}
+			
+			queryStmt := `SELECT id FROM listing_comments WHERE comment_id =$1` 
+			insertStmt := `INSERT INTO listing_comments (listing_id, comment_body, comment_id, author) VALUES ($1, $2, $3, $4) returning id`;
+			for _, commentItem := range commentResp {
+				row := db.QueryRow(queryStmt, listingInfo.ID)
+				var id int
+				switch err := row.Scan(&id); err {
+					case sql.ErrNoRows:
+						var id int
+						err := db.QueryRow(insertStmt, listingInfo.ID, commentItem.Data.Body, commentItem.Data.Name, commentItem.Data.Author).Scan(&id)
+						if err != nil {
+							panic(err)
+						}
+						fmt.Println("New comment inserted; ID is ", id)
+					case nil:
+						fmt.Println("Comment previously saved in DB> ", id)
+					default:
+						panic(err)
+				}
+			}
 		}
 	}
 }
@@ -475,13 +513,13 @@ func main() {
 	defer db.Close()
 
 	http.HandleFunc("/api/", corsHandler(homeHandler, db))
-	http.HandleFunc("/api/reddit/", corsHandler(getRedditListingHandler, db))
+	http.HandleFunc("/api/reddit/", corsHandler(getRedditHandler, db))
 	http.HandleFunc("/api/reddit/authenticate", corsHandler(redditAuthenticate, db))
 	http.HandleFunc("/api/reddit_callback", corsHandler(redditCallback, db))
 	http.HandleFunc("/api/reddit_basic_info", corsHandler(getRedditBasicInfo, db))
 
 	// http.HandleFunc("/", homeHandler)
-	// http.HandleFunc("/reddit/", getRedditListingHandler)
+	// http.HandleFunc("/reddit/", getRedditHandler)
 	// http.HandleFunc("/reddit/authenticate", redditAuthenticate)
 	// http.HandleFunc("/reddit_callback", redditCallback)
 	// http.HandleFunc("/reddit_basic_info", getRedditBasicInfo)
