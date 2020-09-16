@@ -222,7 +222,6 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	insertStmt = `INSERT INTO subreddits (name) VALUES ($1) returning id`;
 	for _, sr := range subreddits.Data.Children {
 		row := db.QueryRow(queryStmt, sr.Data.URL)
-		fmt.Println("DEBUG", sr.Data.URL)
 		var name string
 		switch err := row.Scan(&name); err {
 			case sql.ErrNoRows:
@@ -240,17 +239,16 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 
 	//update subreddit_subscriptions table
-	queryStmt = `SELECT id FROM users_subscription WHERE username =$1 and subreddit_name=$2` 
+	queryStmt = `SELECT id FROM users_subscription WHERE username=$1 and subreddit_name=$2` 
 	insertStmt = `INSERT INTO users_subscription (username, subreddit_name) VALUES ($1, $2) returning id`;
 	for _, sr := range subreddits.Data.Children {
-		row := db.QueryRow(queryStmt, username, sr.Data.URL)
+		row := db.QueryRow(queryStmt, redditBasicInfo.Name, sr.Data.URL)
 		var id int
 		switch err := row.Scan(&id); err {
 			case sql.ErrNoRows:
-				fmt.Printf("DEBUG username is %s", username)
-				fmt.Printf("New subscription for user:%s subreddit %s> ", username, sr.Data.URL)
+				fmt.Printf("New subscription for user:%s subreddit %s> ", redditBasicInfo.Name, sr.Data.URL)
 				var id int
-				err := db.QueryRow(insertStmt, username, sr.Data.URL).Scan(&id)
+				err := db.QueryRow(insertStmt, redditBasicInfo.Name, sr.Data.URL).Scan(&id)
 				if err != nil {
 					panic(err)
 				}
@@ -285,7 +283,6 @@ func getRedditHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	accessToken := r.Header.Get("access-token")
 
-	fmt.Println("DEBUG SUBREDDIT ARRAY has", len(srArray))
 	listingAndCommentChan := make (chan ListingAndCommentChannel, 3*len(srArray)) //there are N*3 listings(N=number of subreddits)
 	listingToHandler := make (chan RedditResponse, len(srArray))
 	for _, sr := range srArray {
