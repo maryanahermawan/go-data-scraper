@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var redditBearerToken RedditBearerTokenResponse
@@ -28,6 +29,12 @@ type RedditResponse struct {
 type RedditResponseData struct {
 	Dist     uint16
 	Children []RedditEntity
+}
+
+//UIListingCommentsBody : listing and comment JSON to return to UI
+type UIListingCommentsBody struct {
+	Listing RedditEntity
+	Comments []RedditEntity
 }
 
 //RedditEntity : kind is either t1, t2 ... t6
@@ -63,9 +70,16 @@ type RedditBasicInfo struct {
 	SubredditSubscription RedditResponse
 }
 
-type ListingAndCommentChannel struct {
+//ListingAndCommentChannelType : listing worker tells comment worker to get comment of listing's permalink
+type ListingAndCommentChannelType struct {
 	Permalink	string
 	ID			int
+}
+
+// CommentToHandlerChannelType : comment worker tells handler the result of REST API call
+type CommentToHandlerChannelType struct {
+	Permalink string
+	Comments []RedditEntity
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -261,7 +275,30 @@ func getRedditBasicInfo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 }
 
+// func getDiscoverSrHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+// 	username := r.URL.Path[len("/api/related_sr_for_user/"):]
+
+// 	queryStmt := `select distinct comments.author, listings.author from listing_comments as comments
+// 	INNER JOIN (users_subscription as subs  INNER JOIN top_listings as listings ON listings.subreddit_name=subs.subreddit_name)
+// 	ON listings.id = comments.listing_id where username = $1`
+
+// 	insertStmt := `INSERT INTO users (username) VALUES ($1) returning id`
+// 	var id int
+// 	var relatedSrArr []string
+// 	switch err := db.QueryRow(queryStmt, username).Scan(&relatedSrArr); err {
+// 		case sql.ErrNoRows:
+// 			fmt.Println("User has not saved any data to find related SR from>", username)
+// 		case nil:
+// 			//get related subreddits
+// 			https://reddit.com/user/joncalhoun/comments.json?t=year&sort=top&limit=10
+// 		default:
+// 			panic(err)
+// 	}
+// }
+
 func getRedditHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	start := time.Now()
+
 	popularityType := r.URL.Path[len("/api/reddit/"):]
 
 	subreddit, ok := r.URL.Query()["subreddit"]
@@ -283,27 +320,50 @@ func getRedditHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	accessToken := r.Header.Get("access-token")
 
-	listingAndCommentChan := make (chan ListingAndCommentChannel, 3*len(srArray)) //there are N*3 listings(N=number of subreddits)
-	listingToHandler := make (chan RedditResponse, len(srArray))
+	listingAndCommentChan := make (chan ListingAndCommentChannelType, 3*len(srArray)) //there are N*3 listings(N=number of subreddits)
+	listingToHandlerChan := make (chan RedditResponse, len(srArray))
+	commentToHandlerChan := make (chan CommentToHandlerChannelType, 9*len(srArray))
+	
 	for _, sr := range srArray {
-		go getRedditListingWorker(accessToken, db, sr, popularityType, period[0], listingCount[0], listingAndCommentChan, listingToHandler)
-		go getRedditCommentWorker(accessToken, db, listingAndCommentChan)
+		go getRedditListingWorker(accessToken, db, sr, popularityType, period[0], listingCount[0], listingAndCommentChan, listingToHandlerChan)
+		go getRedditCommentWorker(accessToken, db, listingAndCommentChan, commentToHandlerChan)
+		go getRedditCommentWorker(accessToken, db, listingAndCommentChan, commentToHandlerChan)
+		go getRedditCommentWorker(accessToken, db, listingAndCommentChan, commentToHandlerChan)
 	}
 
-	var listingArray []RedditResponse
-
+	// var listingArray []RedditResponse
+	var listingAndCommentArr []UIListingCommentsBody
 	for i:=0; i<len(srArray); i++ {
-		listingArray = append(listingArray, <-listingToHandler)
+		listing := <-listingToHandlerChan //listing RedditResponse
+
+		//Spread RedditResponse's children into independent UIListingCommentsBody
+		for j:=0; j<len(listing.Data.Children); j++ {
+		listingAndCommentArr = append(listingAndCommentArr, 
+			UIListingCommentsBody{Listing: listing.Data.Children[j]})
+		}
+	}
+
+	for i:=0; i<3*len(srArray); i++ {
+		comment := <- commentToHandlerChan
+
+		for j:=0; j<len(listingAndCommentArr); j++ {
+			if listingAndCommentArr[j].Listing.Data.Permalink == comment.Permalink {
+				listingAndCommentArr[j].Comments = comment.Comments
+			}
+		}
 	}
 
 	enc := json.NewEncoder(w)
-	if err := enc.Encode(&listingArray); err != nil {
+	if err := enc.Encode(&listingAndCommentArr); err != nil {
 		log.Println(err)
 	}
+
+	elapsed := time.Since(start)
+	fmt.Println("Get reddit handler took %s seconds", elapsed)
 }
 
 func getRedditListingWorker(accessToken string, db *sql.DB, sr string, popularityType string, t string, count string, 
-	listingToCommentWorker chan ListingAndCommentChannel, listingToHandler chan RedditResponse) {
+	listingToCommentWorker chan ListingAndCommentChannelType, listingToHandlerChan chan RedditResponse) {
 	fmt.Println("The beginning of LISTING worker")
 	client := &http.Client{}
 
@@ -316,7 +376,6 @@ func getRedditListingWorker(accessToken string, db *sql.DB, sr string, popularit
 		log.Println("error in getting reddit listing: ", err)
 	}
 
-	// resp.Body = http.MaxBytesReader(w, resp.Body, 1048576)
 	dec := json.NewDecoder(resp.Body)
 	var redditResponse RedditResponse
 	if err := dec.Decode(&redditResponse); err != nil {
@@ -326,7 +385,8 @@ func getRedditListingWorker(accessToken string, db *sql.DB, sr string, popularit
 	}
 
 	//update handler of the listing response
-	listingToHandler <- redditResponse
+	listingToHandlerChan <- redditResponse
+
 	//update top_listings table and update channel to comment-worker:
 	queryStmt := `SELECT id FROM top_listings WHERE reddit_id =$1` 
 	insertStmt := `INSERT INTO top_listings (subreddit_name, reddit_id, listing_title, permalink, selftext, url, author) VALUES ($1, $2, $3, $4, $5, $6, $7) returning id`;
@@ -351,13 +411,14 @@ func getRedditListingWorker(accessToken string, db *sql.DB, sr string, popularit
 
 		//Send listing.Data.Permalink, id (obtain from DB actions above) to channel
 		fmt.Println("Sending to Comment worker, for listingtitle", listing.Data.Title)
-		listingToCommentWorker <- ListingAndCommentChannel{Permalink: listing.Data.Permalink, ID: id}
+		listingToCommentWorker <- ListingAndCommentChannelType{Permalink: listing.Data.Permalink, ID: id}
 	}
 	fmt.Println("The END of LISTING worker")
 }
 
 
-func getRedditCommentWorker(accessToken string, db *sql.DB, inChan chan ListingAndCommentChannel)  {
+func getRedditCommentWorker(accessToken string, db *sql.DB, inChan chan ListingAndCommentChannelType,
+	commentWorkerToHandler chan CommentToHandlerChannelType)  {
 	fmt.Println("The beginning of COMMENT worker")
 	for {
 		select {
@@ -390,7 +451,10 @@ func getRedditCommentWorker(accessToken string, db *sql.DB, inChan chan ListingA
 					}
 				}
 			}
-			
+
+			//update handler of the comment response
+			commentWorkerToHandler <- CommentToHandlerChannelType{Permalink: listingInfo.Permalink, Comments: commentResp}
+
 			queryStmt := `SELECT id FROM listing_comments WHERE comment_id =$1` 
 			insertStmt := `INSERT INTO listing_comments (listing_id, comment_body, comment_id, author) VALUES ($1, $2, $3, $4) returning id`;
 			for _, commentItem := range commentResp {
@@ -515,12 +579,5 @@ func main() {
 	http.HandleFunc("/api/reddit_callback", corsHandler(redditCallback, db))
 	http.HandleFunc("/api/reddit_basic_info", corsHandler(getRedditBasicInfo, db))
 
-	// http.HandleFunc("/", homeHandler)
-	// http.HandleFunc("/reddit/", getRedditHandler)
-	// http.HandleFunc("/reddit/authenticate", redditAuthenticate)
-	// http.HandleFunc("/reddit_callback", redditCallback)
-	// http.HandleFunc("/reddit_basic_info", getRedditBasicInfo)
-	// http.HandleFunc("/fb/authenticate", corsHandler(facebookAuthenticate))
-	// http.HandleFunc("/fb_callback", corsHandler(fbCallback))
 	log.Fatal(http.ListenAndServe(":80", nil))
 }
